@@ -1,0 +1,40 @@
+services:
+  bootstrap:
+    build: .
+    command: -c "bootstrap"
+    ports:
+      - "4001:4001/tcp"
+    networks:
+      poker_net:
+        ipv4_address: 172.20.0.10
+
+  poker1:
+    build: .
+    command: -c "poker /ip4/172.20.0.10/tcp/4001/p2p/$(BOOTSTRAP_PEER_ID)"
+    depends_on:
+      - bootstrap
+    environment:
+      - BOOTSTRAP_PEER_ID
+    stdin_open: true
+    tty: true
+    networks:
+      poker_net:
+
+  poker2:
+    build: .
+    command: -c "poker /ip4/172.20.0.10/tcp/4001/p2p/$(BOOTSTRAP_PEER_ID)"
+    depends_on:
+      - bootstrap
+    environment:
+      - BOOTSTRAP_PEER_ID
+    stdin_open: true
+    tty: true
+    networks:
+      poker_net:
+
+networks:
+  poker_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24 
