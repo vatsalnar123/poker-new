@@ -1,0 +1,19 @@
+# Binaries
+poker
+poker.exe
+bootstrap
+bootstrap.exe
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# User specific
+.gemini/

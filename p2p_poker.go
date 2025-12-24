@@ -21,6 +21,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
+
+	"github.com/vatsalnarula123/poker-new/pkg/game"
 )
 
 const (
@@ -53,12 +55,14 @@ type BetAction struct {
 
 // PokerClient represents a poker player client
 type PokerClient struct {
-	host       host.Host
-	dht        *dht.IpfsDHT
-	ctx        context.Context
-	cancel     context.CancelFunc
-	peers      map[peer.ID]network.Stream
-	playerName string
+	host         host.Host
+	dht          *dht.IpfsDHT
+	ctx          context.Context
+	cancel       context.CancelFunc
+	peers        map[peer.ID]network.Stream
+	playerName   string
+	gameState    *game.GameState
+	shuffleState *game.ShuffleState
 }
 
 // NewPokerClient creates a new poker client
@@ -91,6 +95,7 @@ func NewPokerClient(bootstrapAddr string) (*PokerClient, error) {
 		cancel:     cancel,
 		peers:      make(map[peer.ID]network.Stream),
 		playerName: fmt.Sprintf("Player_%s", h.ID().String()[:8]),
+		gameState:  game.NewGameState(),
 	}
 
 	// Set stream handler for incoming connections
@@ -161,12 +166,33 @@ func (p *PokerClient) handleGameMessage(msg GameMessage, from peer.ID) {
 	switch msg.Type {
 	case "join":
 		fmt.Printf("🎮 %s joined the game!\n", msg.PlayerID)
+		// Add player to local game state
+		// Note: In a real implementation, we need the peer ID from the message or connection
+		// For now, we use the 'from' peer ID.
+		p.gameState.AddPlayer(&game.Player{
+			ID:    from,
+			Name:  msg.PlayerID, // msg.PlayerID is the name string here
+			Stack: 1000,         // Default stack
+			Bet:   0,
+		})
+
 	case "bet":
 		if data, ok := msg.Data.(map[string]interface{}); ok {
 			action := data["action"].(string)
 			amount := int(data["amount"].(float64))
 			fmt.Printf("💰 %s performed action: %s (amount: %d)\n", msg.PlayerID, action, amount)
+
+			// Apply to game state
+			// We need to find the player ID by name or use 'from'
+			// Ideally msg.PlayerID should be the peer ID, but here it's the name.
+			// Let's assume 'from' is the correct ID.
+			if err := p.gameState.ApplyAction(from, action, amount); err != nil {
+				log.Printf("Error applying action: %v", err)
+			} else {
+				fmt.Printf("State updated. Pot: %d, Current Bet: %d\n", p.gameState.Pot, p.gameState.CurrentBet)
+			}
 		}
+
 	case "chat":
 		fmt.Printf("💬 %s: %s\n", msg.PlayerID, msg.Data.(string))
 	case "game_state":
