@@ -82,6 +82,3 @@ go build -o bootstrap ./cmd/bootstrap
 ├── Dockerfile          # Multi-stage build
 └── docker-compose.yml  # Local cluster setup
 ```
-
-## 📜 License
-MIT
