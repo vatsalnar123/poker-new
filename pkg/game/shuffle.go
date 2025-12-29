@@ -1,8 +1,19 @@
 package game
 
 import (
+	"fmt"
+
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/vatsalnarula123/poker-new/pkg/crypto"
+)
+
+// ShufflePhase represents the current phase of the shuffle protocol
+type ShufflePhase string
+
+const (
+	PhaseEncrypt ShufflePhase = "encrypt" // First pass: encrypt + shuffle
+	PhaseDecrypt ShufflePhase = "decrypt" // Second pass: decrypt only
+	PhaseDone    ShufflePhase = "done"    // Shuffle complete
 )
 
 // ShuffleState tracks the progress of the distributed shuffle.
@@ -10,6 +21,7 @@ type ShuffleState struct {
 	MyID         peer.ID
 	Participants []peer.ID
 	CurrentStep  int
+	Phase        ShufflePhase
 	Cipher       *crypto.Cipher
 }
 
@@ -19,6 +31,7 @@ func NewShuffleState(myID peer.ID, participants []peer.ID, secret string) *Shuff
 		MyID:         myID,
 		Participants: participants,
 		CurrentStep:  0,
+		Phase:        PhaseEncrypt,
 		Cipher:       crypto.NewCipher(secret),
 	}
 }
@@ -74,28 +87,42 @@ func (ss *ShuffleState) HandleShuffleMessage(deck EncryptedDeck) (EncryptedDeck,
 
 	processedDeck := make(EncryptedDeck, len(deck))
 	for i, card := range deck {
-		processedDeck[i] = ss.Cipher.XOR(card)
+		// Use the ORIGINAL card index as salt for consistency
+		salt := []byte(fmt.Sprintf("%d", card.OriginalIdx))
+		processedDeck[i] = EncryptedCard{
+			Data:        ss.Cipher.XOR(card.Data, salt),
+			OriginalIdx: card.OriginalIdx,
+		}
 	}
-
-	// If we are in the first pass (Encryption), we shuffle.
-	// How do we know if it's the first pass?
-	// We can track how many times we've seen the deck.
-	// But `ShuffleState` is local.
-	// Let's add a `Pass` field.
 
 	ss.CurrentStep++
 
-	// Heuristic: If we are just starting or in the first loop.
-	// Let's assume the caller manages the phase.
-	// But for this function, let's add a `shuffle` param?
-	// Or better, let the caller call `Shuffle()` on the returned deck if needed.
+	// Update phase based on current step
+	numPlayers := len(ss.Participants)
+	if ss.CurrentStep <= numPlayers {
+		ss.Phase = PhaseEncrypt
+	} else if ss.CurrentStep <= numPlayers*2 {
+		ss.Phase = PhaseDecrypt
+	} else {
+		ss.Phase = PhaseDone
+	}
 
 	return processedDeck, "", nil
 }
 
-// PerformShuffle shuffles the deck.
+// PerformShuffle shuffles the deck (only during encryption phase).
 func (ss *ShuffleState) PerformShuffle(deck EncryptedDeck) {
 	deck.Shuffle()
+}
+
+// ShouldShuffle returns true if we should shuffle in the current phase.
+func (ss *ShuffleState) ShouldShuffle() bool {
+	return ss.Phase == PhaseEncrypt
+}
+
+// IsComplete returns true if the shuffle protocol is complete.
+func (ss *ShuffleState) IsComplete() bool {
+	return ss.Phase == PhaseDone
 }
 
 // GetNextPeer returns the peer ID of the next player in the ring.

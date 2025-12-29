@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -38,10 +39,11 @@ type Player struct {
 
 // GameState holds all the shared information about the current state of the poker game.
 type GameState struct {
+	mu             sync.RWMutex        `json:"-"` // Protects concurrent access to Players map and game state
 	Players        map[peer.ID]*Player `json:"players"`
 	HostID         peer.ID             `json:"host_id"`
 	Deck           Deck                `json:"-"` // Deck is not sent over network.
-	EncryptedDeck  [][]byte            `json:"encrypted_deck"`
+	EncryptedDeck  EncryptedDeck       `json:"encrypted_deck"`
 	Pot            int                 `json:"pot"`
 	CommunityCards []Card              `json:"community_cards"`
 	Phase          GamePhase           `json:"phase"`
@@ -49,19 +51,35 @@ type GameState struct {
 	CurrentBet     int                 `json:"current_bet"` // The highest bet amount for the current round
 	LastRaiser     peer.ID             `json:"last_raiser"` // The peer who made the last aggressive action (bet or raise)
 	Dealer         peer.ID             `json:"dealer"`
+
+	// Blind positions and amounts
+	SmallBlind       peer.ID `json:"small_blind"`        // Player in small blind position
+	BigBlind         peer.ID `json:"big_blind"`          // Player in big blind position
+	SmallBlindAmount int     `json:"small_blind_amount"` // Small blind amount (default: 2)
+	BigBlindAmount   int     `json:"big_blind_amount"`   // Big blind amount (default: 4)
+
+	// Community card indices in EncryptedDeck
+	FlopIndices  []int `json:"flop_indices"`  // Indices of flop cards (3 cards)
+	TurnIndex    int   `json:"turn_index"`    // Index of turn card
+	RiverIndex   int   `json:"river_index"`   // Index of river card
 }
 
 // NewGameState creates and initializes a new GameState object.
 func NewGameState() *GameState {
 	return &GameState{
-		Players:        make(map[peer.ID]*Player),
-		CommunityCards: make([]Card, 0),
-		Phase:          Idle,
+		Players:          make(map[peer.ID]*Player),
+		CommunityCards:   make([]Card, 0),
+		Phase:            Idle,
+		SmallBlindAmount: 2, // Default small blind
+		BigBlindAmount:   4, // Default big blind
 	}
 }
 
 // GetPlayerOrder returns a sorted slice of player IDs for deterministic turn order.
 func (gs *GameState) GetPlayerOrder() []peer.ID {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
 	ids := make([]peer.ID, 0, len(gs.Players))
 	for id := range gs.Players {
 		ids = append(ids, id)
@@ -74,6 +92,9 @@ func (gs *GameState) GetPlayerOrder() []peer.ID {
 
 // NextPlayerInOrder finds the next player who is still in the hand.
 func (gs *GameState) NextPlayerInOrder(playerIDs []peer.ID, currentIndex int) peer.ID {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
 	numPlayers := len(playerIDs)
 	for i := 1; i <= numPlayers; i++ {
 		nextIndex := (currentIndex + i) % numPlayers
@@ -111,11 +132,120 @@ func GenerateCommitment(hand []Card, salt string) string {
 
 // AddPlayer adds a new player to the game state.
 func (gs *GameState) AddPlayer(player *Player) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
 	gs.Players[player.ID] = player
+}
+
+// SetupBlinds assigns small blind and big blind positions based on dealer
+func (gs *GameState) SetupBlinds() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	playerOrder := gs.getPlayerOrderUnsafe()
+	if len(playerOrder) < 2 {
+		return // Need at least 2 players
+	}
+
+	// Find dealer index
+	dealerIdx := -1
+	for i, id := range playerOrder {
+		if id == gs.Dealer {
+			dealerIdx = i
+			break
+		}
+	}
+
+	// If no dealer set, use first player
+	if dealerIdx == -1 {
+		dealerIdx = 0
+		gs.Dealer = playerOrder[0]
+	}
+
+	// Small blind is left of dealer
+	gs.SmallBlind = playerOrder[(dealerIdx+1)%len(playerOrder)]
+	// Big blind is left of small blind
+	gs.BigBlind = playerOrder[(dealerIdx+2)%len(playerOrder)]
+}
+
+// PostBlinds deducts blind amounts from players and adds to pot
+func (gs *GameState) PostBlinds() error {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	sbPlayer := gs.Players[gs.SmallBlind]
+	bbPlayer := gs.Players[gs.BigBlind]
+
+	if sbPlayer == nil || bbPlayer == nil {
+		return fmt.Errorf("blind players not found")
+	}
+
+	// Post small blind
+	sbAmount := gs.SmallBlindAmount
+	if sbAmount > sbPlayer.Stack {
+		sbAmount = sbPlayer.Stack // All-in if not enough chips
+	}
+	sbPlayer.Stack -= sbAmount
+	sbPlayer.Bet = sbAmount
+	gs.Pot += sbAmount
+
+	// Post big blind
+	bbAmount := gs.BigBlindAmount
+	if bbAmount > bbPlayer.Stack {
+		bbAmount = bbPlayer.Stack // All-in if not enough chips
+	}
+	bbPlayer.Stack -= bbAmount
+	bbPlayer.Bet = bbAmount
+	gs.Pot += bbAmount
+
+	// Set current bet to big blind amount
+	gs.CurrentBet = bbAmount
+
+	// First to act is left of big blind
+	playerOrder := gs.getPlayerOrderUnsafe()
+	bbIdx := -1
+	for i, id := range playerOrder {
+		if id == gs.BigBlind {
+			bbIdx = i
+			break
+		}
+	}
+	if bbIdx != -1 {
+		gs.CurrentTurn = playerOrder[(bbIdx+1)%len(playerOrder)]
+	}
+
+	return nil
+}
+
+// getPlayerOrderUnsafe is an internal helper (no lock - must be called with lock held)
+func (gs *GameState) getPlayerOrderUnsafe() []peer.ID {
+	ids := make([]peer.ID, 0, len(gs.Players))
+	for id := range gs.Players {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return ids[i].String() < ids[j].String()
+	})
+	return ids
 }
 
 // ApplyAction applies a player's action to the game state.
 func (gs *GameState) ApplyAction(playerID peer.ID, action string, amount int) error {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	// 0. CRITICAL SECURITY: Prevent betting before hand commitments
+	if gs.Phase == PreFlop && action != "fold" {
+		// Verify player has committed their hand
+		player := gs.Players[playerID]
+		if player == nil {
+			return fmt.Errorf("player not found")
+		}
+		if player.Commitment == "" {
+			return fmt.Errorf("❌ ANTI-CHEAT: must commit hand before betting")
+		}
+	}
+
 	// 1. Validate it's the player's turn
 	if gs.CurrentTurn != playerID {
 		return fmt.Errorf("it is not %s's turn", playerID)
@@ -126,7 +256,24 @@ func (gs *GameState) ApplyAction(playerID peer.ID, action string, amount int) er
 		return fmt.Errorf("player not found")
 	}
 
-	// 2. Process Action
+	// 2. BET VALIDATION: Prevent invalid bets
+	if action == "bet" || action == "raise" {
+		// Check for negative or zero bets
+		if amount <= 0 {
+			return fmt.Errorf("bet amount must be positive, got %d", amount)
+		}
+		// Check if player has enough chips
+		diff := amount - player.Bet
+		if diff > player.Stack {
+			return fmt.Errorf("insufficient funds: need %d but only have %d", diff, player.Stack)
+		}
+		// Check minimum raise size
+		if amount < gs.CurrentBet {
+			return fmt.Errorf("bet amount %d is less than current bet %d", amount, gs.CurrentBet)
+		}
+	}
+
+	// 3. Process Action
 	switch action {
 	case "fold":
 		player.InHand = false
@@ -148,13 +295,8 @@ func (gs *GameState) ApplyAction(playerID peer.ID, action string, amount int) er
 		gs.Pot += toCall
 
 	case "bet", "raise":
-		if amount < gs.CurrentBet {
-			return fmt.Errorf("bet amount %d is less than current bet %d", amount, gs.CurrentBet)
-		}
+		// Validation already done above, just process the bet
 		diff := amount - player.Bet
-		if diff > player.Stack {
-			return fmt.Errorf("insufficient funds")
-		}
 		player.Stack -= diff
 		player.Bet += diff // Total bet in this round
 		gs.Pot += diff
